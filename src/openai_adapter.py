@@ -5,7 +5,7 @@ import time
 import re
 from typing import List, Dict, Optional, Any, Union, AsyncGenerator, Literal, Tuple
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import logging
 
 import google.generativeai as genai
@@ -45,18 +45,30 @@ class ChatMessage(BaseModel):
     tool_call_id: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = None
 
-    @validator('content', pre=True)
+    @field_validator('content', mode='before')
+    @classmethod
     def validate_content(cls, v, values):
-        role = values.get('role')
+        """验证消息内容的有效性"""
+        if hasattr(values, 'data'):
+            role = values.data.get('role') if hasattr(values, 'data') else values.get('role')
+        else:
+            role = values.get('role')
         # tool角色的消息必须有content
         if role == 'tool' and not v:
             raise ValueError("Tool messages must have content")
         return v
 
-    @validator('tool_calls', pre=True)
+    @field_validator('tool_calls', mode='before')
+    @classmethod
     def validate_tool_calls(cls, v, values):
-        if v is not None and values.get('role') != 'assistant':
-            raise ValueError("Only assistant messages can have tool_calls")
+        """验证工具调用只能在assistant消息中使用"""
+        if v is not None:
+            if hasattr(values, 'data'):
+                role = values.data.get('role') if hasattr(values, 'data') else values.get('role')
+            else:
+                role = values.get('role')
+            if role != 'assistant':
+                raise ValueError("Only assistant messages can have tool_calls")
         return v
 
 class ChatCompletionRequest(BaseModel):
@@ -74,7 +86,8 @@ class ChatCompletionRequest(BaseModel):
     class Config:
         extra = 'allow'
 
-    @validator('tools')
+    @field_validator('tools', mode='before')
+    @classmethod
     def validate_tools(cls, v):
         if v is not None:
             for i, tool in enumerate(v):
@@ -91,11 +104,12 @@ class ChatCompletionRequest(BaseModel):
                     raise ValueError(f"Tool {i}: Function parameters must be a dictionary")
         return v
 
-    @validator('tool_choice')
-    def validate_tool_choice(cls, v, values):
-        if v is not None and not values.get('tools'):
+    @model_validator(mode='after')
+    def validate_tools_and_choice(self):
+        """验证工具和工具选择的一致性"""
+        if self.tool_choice is not None and not self.tools:
             raise ValueError("tool_choice can only be set when tools are provided")
-        return v
+        return self
 
 
 # ========== 转换器类 - 修复版 ==========

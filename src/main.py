@@ -20,6 +20,10 @@ from google.api_core import exceptions as google_exceptions
 from src.openai_adapter import (
     ChatCompletionRequest, APIConfig
 )
+# 导入新的 gemini_adapter 模块
+from src.gemini_adapter import (
+    NativeGeminiAdapter, GeminiGenerateContentRequest, GeminiStreamGenerateContentRequest
+)
 from src.config import get_config
 from src.performance import initialize_performance_modules, get_performance_stats, monitor_performance
 
@@ -264,17 +268,23 @@ class GeminiKeyManager:
             return True
 
     async def update_key_status(self, key: str, status: KeyStatus) -> bool:
-        """更新密钥状态"""
+        """更新密钥状态，增加安全性验证"""
+        if not key or len(key) < 16:
+            logger.warning("Invalid key format for status update")
+            return False
+            
         async with self.lock:
             if key not in self.keys:
+                logger.warning(f"Key not found for status update: {key[:8]}...")
                 return False
             
+            old_status = self.keys[key].status
             self.keys[key].status = status
             if status == KeyStatus.ACTIVE:
                 self.keys[key].cooling_until = None
                 self.keys[key].failure_count = 0
             
-            logger.info(f"Updated key {key[:8]}... status to {status.value}")
+            logger.info(f"Updated key {key[:8]}... status from {old_status.value} to {status.value}")
             return True
 
 key_manager: Optional[GeminiKeyManager] = None
@@ -536,12 +546,13 @@ class OAIStyleGeminiAdapter:
         raise HTTPException(status_code=status_code, detail=detail)
 
 adapter: Optional[OAIStyleGeminiAdapter] = None
+gemini_adapter: Optional[NativeGeminiAdapter] = None
 
 # --- FastAPI 应用生命周期 ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global key_manager, adapter, api_config
+    global key_manager, adapter, api_config, gemini_adapter
     
     # 启动时的初始化
     logger.info("🚀 Starting OpenAI-Style Gemini Adapter...")
@@ -577,10 +588,14 @@ async def lifespan(app: FastAPI):
         adapter = OAIStyleGeminiAdapter(key_manager, api_config)
         logger.info("✅ OpenAI-Style Gemini Adapter initialized")
         
+        gemini_adapter = NativeGeminiAdapter(key_manager)
+        logger.info("✅ Native Gemini API Adapter initialized")
+        
         # 输出启动信息
         stats = await key_manager.get_stats()
         logger.info(f"🔑 API Keys: {stats['active']} active, {stats['cooling']} cooling, {stats['failed']} failed")
-        logger.info("🎯 OpenAI-Style Gemini Adapter started successfully!")
+        # 日志记录服务启动成功
+        logger.info("🎯 OpenAI-Style Gemini Adapter with Native Gemini API started successfully!")
         
         yield
         
@@ -593,21 +608,32 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI 应用实例 ---
 app = FastAPI(
-    title="OpenAI-Style Gemini Adapter",
+    title="OpenAI-Style Gemini Adapter with Native Gemini API",
     description="""
-    Advanced bridge between OpenAI API and Google's Gemini Pro with enhanced features.
+    Advanced bridge between OpenAI API and Google's Gemini Pro with enhanced features, now including native Gemini API support.
     
     ## Features
     - 🔄 Intelligent API key rotation with success tracking
-    - 🚀 Streaming and non-streaming responses
+    - 🚀 Streaming and non-streaming responses (both OpenAI and Gemini formats)
     - 🛠️ Enhanced function/tool calling support with validation
     - 📊 Comprehensive performance monitoring
     - 🔒 Secure API key management with detailed statistics
-    - 🌐 Full OpenAI API compatibility
+    - 🌐 Full OpenAI API compatibility + Native Gemini API endpoints
     - ⚡ Optimized error handling and recovery
     - 🎯 Smart quota management and exponential backoff
     - 🔧 Dynamic key management for runtime flexibility
     - 🎛️ Advanced generation parameters (top_p, JSON format, multiple candidates)
+    - 🆕 Native Gemini API endpoints with original request/response formats
+    
+    ## Endpoints
+    ### OpenAI Compatible API:
+    - `/v1/chat/completions` - OpenAI-compatible chat completions
+    - `/v1/models` - List available models
+    
+    ### Native Gemini API:
+    - `/gemini/v1beta/models/{model}:generateContent` - Non-streaming content generation
+    - `/gemini/v1beta/models/{model}:streamGenerateContent` - Streaming content generation
+    - `/gemini/v1beta/models` - List available Gemini models
     
     ## Authentication
     Use either:
@@ -619,7 +645,7 @@ app = FastAPI(
     - Smart key rotation on failures
     - Detailed error reporting and logging
     """,
-    version="4.2.0",
+    version="5.0.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -751,7 +777,7 @@ async def health_check():
         "status": "healthy" if is_healthy else "degraded",
         "timestamp": int(time.time()),
         "service": "OpenAI-Style Gemini Adapter",
-        "version": "4.2.0",
+        "version": "5.0.0",
         "key_summary": stats,
         "performance": detailed_stats["performance"],
         "uptime": time.time() - getattr(app.state, 'start_time', time.time()),
@@ -789,17 +815,26 @@ async def get_stats(client_key: str = Depends(verify_api_key)):
           status_code=201)
 async def add_gemini_key(
     admin_key: str = Depends(verify_admin_key),
-    key_to_add: str = Body(..., embed=True, description="The Gemini API key to add.")
+    key_data: Dict[str, str] = Body(..., description="The Gemini API key to add in JSON format: {'key': 'your_key_here'}")
 ):
-    """动态添加一个新的Gemini API密钥到池中。"""
+    """动态添加一个新的Gemini API密钥到池中，增强安全性验证"""
     if not key_manager:
         raise HTTPException(status_code=503, detail="Key Manager not initialized")
+    
+    # 安全验证：提取密钥
+    key_to_add = key_data.get("key", "").strip()
+    if not key_to_add or len(key_to_add) < 16:
+        raise HTTPException(status_code=400, detail="Invalid API key format")
+    
+    # 验证密钥格式（Gemini密钥通常以AIza开头）
+    if not key_to_add.startswith("AIza"):
+        logger.warning("Potential invalid Gemini API key format detected")
     
     success = await key_manager.add_key(key_to_add)
     if not success:
         raise HTTPException(status_code=409, detail="API key already exists.")
     
-    return {"status": "success", "message": f"API key starting with {key_to_add[:8]} added."}
+    return {"status": "success", "message": f"API key starting with {key_to_add[:8]}... added successfully"}
 
 
 @app.delete("/admin/keys", 
@@ -808,17 +843,22 @@ async def add_gemini_key(
             status_code=200)
 async def remove_gemini_key(
     admin_key: str = Depends(verify_admin_key),
-    key_to_remove: str = Body(..., embed=True, description="The Gemini API key to remove.")
+    key_data: Dict[str, str] = Body(..., description="The Gemini API key to remove in JSON format: {'key': 'your_key_here'}")
 ):
-    """从池中动态移除一个指定的Gemini API密钥。"""
+    """从池中动态移除一个指定的Gemini API密钥，增强安全性验证"""
     if not key_manager:
         raise HTTPException(status_code=503, detail="Key Manager not initialized")
+
+    # 安全验证：提取密钥
+    key_to_remove = key_data.get("key", "").strip()
+    if not key_to_remove or len(key_to_remove) < 16:
+        raise HTTPException(status_code=400, detail="Invalid API key format")
 
     success = await key_manager.remove_key(key_to_remove)
     if not success:
         raise HTTPException(status_code=404, detail="API key not found.")
     
-    return {"status": "success", "message": f"API key starting with {key_to_remove[:8]} removed."}
+    return {"status": "success", "message": f"API key starting with {key_to_remove[:8]}... removed successfully"}
 
 
 @app.put("/admin/keys/{key_id}", 
@@ -841,8 +881,9 @@ async def update_gemini_key_status(
             full_key = k
             break
             
-    if not full_key:
-         raise HTTPException(status_code=404, detail=f"No key found starting with '{key_id}'")
+        # 验证密钥状态更新操作是否成功
+        if not full_key:
+            raise HTTPException(status_code=404, detail=f"No key found starting with '{key_id}'")
 
     success = await key_manager.update_key_status(full_key, status)
     if not success:
@@ -850,3 +891,174 @@ async def update_gemini_key_status(
         raise HTTPException(status_code=404, detail="API key not found for status update.")
 
     return {"status": "success", "message": f"Status of key {full_key[:8]}... updated to {status.value}."}
+
+
+# --- 原生 Gemini API 端点 ---
+
+@app.get("/gemini/v1beta/models", 
+         summary="List Gemini models", 
+         description="List available Gemini models in native format",
+         tags=["Native Gemini API"])
+async def list_gemini_models(client_key: str = Depends(verify_api_key)):
+    """列出可用的Gemini模型（原生格式）"""
+    
+    # 返回Gemini原生的模型列表格式
+    models = [
+        {
+            "name": "models/gemini-1.5-pro-latest",
+            "baseModelId": "models/gemini-1.5-pro",
+            "version": "latest",
+            "displayName": "Gemini 1.5 Pro Latest",
+            "description": "最新版本的 Gemini 1.5 Pro，具有最佳性能和功能",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 8192,
+            "supportedGenerationMethods": [
+                "generateContent",
+                "streamGenerateContent"
+            ],
+            "temperature": 1.0,
+            "maxTemperature": 2.0,
+            "topP": 0.95,
+            "topK": 64
+        },
+        {
+            "name": "models/gemini-1.5-flash-latest",
+            "baseModelId": "models/gemini-1.5-flash",
+            "version": "latest",
+            "displayName": "Gemini 1.5 Flash Latest",
+            "description": "最新版本的 Gemini 1.5 Flash，优化了速度和效率",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 8192,
+            "supportedGenerationMethods": [
+                "generateContent",
+                "streamGenerateContent"
+            ],
+            "temperature": 1.0,
+            "maxTemperature": 2.0,
+            "topP": 0.95,
+            "topK": 64
+        },
+        {
+            "name": "models/gemini-1.5-pro",
+            "baseModelId": "models/gemini-1.5-pro",
+            "version": "001",
+            "displayName": "Gemini 1.5 Pro",
+            "description": "Gemini 1.5 Pro 稳定版本",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 8192,
+            "supportedGenerationMethods": [
+                "generateContent",
+                "streamGenerateContent"
+            ],
+            "temperature": 1.0,
+            "maxTemperature": 2.0,
+            "topP": 0.95,
+            "topK": 64
+        },
+        {
+            "name": "models/gemini-1.5-flash",
+            "baseModelId": "models/gemini-1.5-flash",
+            "version": "001",
+            "displayName": "Gemini 1.5 Flash",
+            "description": "Gemini 1.5 Flash 稳定版本",
+            "inputTokenLimit": 1048576,
+            "outputTokenLimit": 8192,
+            "supportedGenerationMethods": [
+                "generateContent",
+                "streamGenerateContent"
+            ],
+            "temperature": 1.0,
+            "maxTemperature": 2.0,
+            "topP": 0.95,
+            "topK": 64
+        }
+    ]
+    
+    return {"models": models}
+
+
+@app.post("/gemini/v1beta/models/{model}:generateContent",
+          summary="Generate content (Non-streaming)",
+          description="Generate content using native Gemini API format (non-streaming)",
+          tags=["Native Gemini API"])
+async def gemini_generate_content(
+    model: str,
+    request: GeminiGenerateContentRequest,
+    client_key: str = Depends(verify_api_key)
+):
+    """原生Gemini API - 生成内容（非流式）"""
+    if not gemini_adapter:
+        raise HTTPException(status_code=503, detail="Native Gemini adapter not initialized")
+    
+    try:
+        async with monitor_performance("gemini_generate_content"):
+            response = await gemini_adapter.process_generate_content(request, model)
+            return JSONResponse(content=response)
+                
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in Gemini generateContent: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/gemini/v1beta/models/{model}:streamGenerateContent",
+          summary="Generate content (Streaming)",
+          description="Generate content using native Gemini API format (streaming)",
+          tags=["Native Gemini API"])
+async def gemini_stream_generate_content(
+    model: str,
+    request: GeminiStreamGenerateContentRequest,
+    client_key: str = Depends(verify_api_key)
+):
+    """原生Gemini API - 生成内容（流式）"""
+    if not gemini_adapter:
+        raise HTTPException(status_code=503, detail="Native Gemini adapter not initialized")
+    
+    try:
+        async with monitor_performance("gemini_stream_generate_content"):
+            response_stream = await gemini_adapter.process_stream_generate_content(request, model)
+            
+            return StreamingResponse(
+                response_stream, 
+                media_type="application/json",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*",
+                    "X-Accel-Buffering": "no",
+                }
+            )
+                
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in Gemini streamGenerateContent: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.get("/gemini/health",
+         summary="Native Gemini API Health Check", 
+         description="Check native Gemini API health",
+         tags=["Native Gemini API"])
+async def gemini_health_check():
+    """原生Gemini API健康检查"""
+    if not key_manager or not gemini_adapter:
+        raise HTTPException(status_code=503, detail="Native Gemini adapter not initialized")
+    
+    stats = await key_manager.get_stats()
+    is_healthy = stats["active"] > 0
+    status_code = 200 if is_healthy else 503
+    
+    health_data = {
+        "status": "healthy" if is_healthy else "degraded",
+        "timestamp": int(time.time()),
+        "service": "Native Gemini API Adapter",
+        "version": "5.0.0",
+        "availableKeys": stats["active"],
+        "totalKeys": stats["total"],
+        "message": "Native Gemini API operational" if is_healthy else "Some API keys unavailable"
+    }
+    
+    return JSONResponse(content=health_data, status_code=status_code)

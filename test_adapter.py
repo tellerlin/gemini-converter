@@ -53,19 +53,20 @@ TESTS = [
         }
     },
     {
-        "name": "Legacy OpenAI API - Chat Completions",
+        "name": "OpenAI Compatible API - Chat Completions", 
         "endpoint": "/v1/chat/completions",
         "method": "POST",
         "headers": {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {CLIENT_KEY}"
+            "X-API-Key": CLIENT_KEY
         },
         "body": {
-            "model": "gemini-2.5-pro",
+            "model": "gpt-4o",
             "messages": [
                 {"role": "user", "content": "Hello! Can you tell me about Paris in 2-3 sentences?"}
             ],
-            "max_tokens": 100
+            "max_tokens": 100,
+            "temperature": 0.7
         }
     },
     {
@@ -73,7 +74,7 @@ TESTS = [
         "endpoint": "/v1/models",
         "method": "GET",
         "headers": {
-            "Authorization": f"Bearer {CLIENT_KEY}"
+            "X-API-Key": CLIENT_KEY
         }
     },
     {
@@ -133,7 +134,8 @@ async def run_test(test):
 
 async def main():
     """Run all tests"""
-    print("🚀 Gemini Claude Adapter v2.0.0 Test Suite")
+    print("🚀 Gemini Converter API Test Suite")
+    print("Testing OpenAI-compatible endpoints with Gemini backend")
     print("=" * 60)
     
     # First check if the server is running
