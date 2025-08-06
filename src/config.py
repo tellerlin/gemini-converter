@@ -33,7 +33,7 @@ class AppConfig(BaseSettings):
     # =============================================
     SERVICE_ENVIRONMENT: Environment = Field(Environment.DEVELOPMENT, description="Runtime environment")
     SERVICE_HOST: str = Field("0.0.0.0", description="Service host")
-    SERVICE_PORT: int = Field(8000, description="Service port")
+    SERVICE_PORT: int = Field(8100, description="Service port")
     SERVICE_WORKERS: int = Field(1, description="Number of workers")
     SERVICE_LOG_LEVEL: LogLevel = Field(LogLevel.INFO, description="Log level")
     SERVICE_CORS_ORIGINS: Union[str, List[str]] = Field(default="*", description="CORS allowed origins")
@@ -77,7 +77,7 @@ class AppConfig(BaseSettings):
         if isinstance(v, list):
             return [str(key).strip() for key in v if str(key).strip()]
         return v
-
+    
     @field_validator('SERVICE_CORS_ORIGINS', mode='before')
     @classmethod
     def validate_cors_origins(cls, v):
@@ -98,8 +98,10 @@ class AppConfig(BaseSettings):
     
     def _validate_config(self):
         """Validate configuration consistency"""
-        if self.SERVICE_ENVIRONMENT == Environment.PRODUCTION and not self.GEMINI_API_KEYS:
-            raise ValueError("Production environment requires at least one Gemini API key (GEMINI_API_KEYS)")
+        # [MODIFIED] Enforce GEMINI_API_KEYS presence regardless of environment
+        # to prevent startup crash in GeminiKeyManager.
+        if not self.GEMINI_API_KEYS:
+            raise ValueError("At least one Gemini API key is required. Please set GEMINI_API_KEYS in your .env file.")
         
         if self.CACHE_ENABLED and self.CACHE_MAX_SIZE <= 0:
             raise ValueError("CACHE_MAX_SIZE must be positive when caching is enabled")

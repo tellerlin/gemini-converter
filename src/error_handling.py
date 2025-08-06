@@ -1,3 +1,15 @@
+# [NOTE] This file contains robust error handling utilities but is not currently
+# integrated into the application. To use it, import the `monitor_errors`
+# decorator and apply it to the API endpoint functions in `src/main.py`.
+# Example in `src/main.py`:
+#
+# from src.error_handling import monitor_errors
+# ...
+# @app.post("/v1/chat/completions", ...)
+# @monitor_errors
+# async def create_chat_completion(...)
+#
+
 """
 Enhanced error handling and monitoring for Gemini Claude Adapter
 """

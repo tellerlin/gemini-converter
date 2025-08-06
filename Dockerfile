@@ -39,10 +39,10 @@ RUN mkdir -p logs && chown appuser:appuser logs
 
 USER appuser
 
-EXPOSE 8000
+EXPOSE 8100
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD python -c "import urllib.request; exit(0) if urllib.request.urlopen('http://localhost:8000/health', timeout=10).getcode() == 200 else exit(1)"
+  CMD python -c "import urllib.request; exit(0) if urllib.request.urlopen('http://localhost:8100/health', timeout=10).getcode() == 200 else exit(1)"
 
 # 使用启动脚本来启动应用
 CMD ["./start.sh"]
