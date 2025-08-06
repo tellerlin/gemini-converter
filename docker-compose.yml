@@ -1,17 +1,18 @@
 services:
-  gemini-claude-adapter:
+  gemini-converter-adapter:
     build: .
-    container_name: gemini-claude-adapter
+    container_name: gemini-converter-adapter
     restart: always
     ports:
-      # 将主机的 8100 端口映射到容器的 8100 端口
-      # 这样可以避免与主机上可能运行的其他服务（如Nginx）发生端口冲突
       - "8100:8100"
     env_file:
       - ./.env
     volumes:
-      # Mount the logs directory
-      - ./logs:/app/logs
+      # Use a named volume for logs
+      - logs_data:/app/logs
       # Mount the entire project directory to /data for easy access if needed
       - .:/data
-    # [修正] 移除 user: "0:0" 行，以使用 Dockerfile 中定义的 appuser
+
+# Define the named volume at the top level
+volumes:
+  logs_data:
