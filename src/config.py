@@ -34,7 +34,6 @@ class AppConfig(BaseSettings):
     SERVICE_ENVIRONMENT: Environment = Field(Environment.DEVELOPMENT, description="Runtime environment")
     SERVICE_HOST: str = Field("0.0.0.0", description="Service host")
     SERVICE_PORT: int = Field(8100, description="Service port")
-    SERVICE_WORKERS: int = Field(1, description="Number of workers")
     SERVICE_LOG_LEVEL: LogLevel = Field(LogLevel.INFO, description="Log level")
     SERVICE_CORS_ORIGINS: Union[str, List[str]] = Field(default="*", description="CORS allowed origins")
     

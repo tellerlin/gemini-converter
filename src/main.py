@@ -20,7 +20,7 @@ from google.api_core import exceptions as google_exceptions
 from src.openai_adapter import (
     ChatCompletionRequest, APIConfig
 )
-from src.config import load_configuration, get_config
+from src.config import get_config
 from src.performance import initialize_performance_modules, get_performance_stats, monitor_performance
 
 # 加载环境变量
