@@ -473,7 +473,7 @@ class NativeGeminiAdapter:
                     api_call_kwargs["safety_settings"] = safety_settings
                 
                 # 调用流式API
-                stream = model.generate_content_async(contents, **api_call_kwargs)
+                stream = await model.generate_content_async(contents, **api_call_kwargs)
                 
                 # 包装流式响应
                 async def wrapped_stream():

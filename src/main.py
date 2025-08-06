@@ -223,8 +223,16 @@ class GeminiKeyManager:
             total_requests = sum(k.total_requests for k in self.keys.values())
             total_successful = sum(k.successful_requests for k in self.keys.values())
             
+            # 计算统计信息而不是调用 get_stats() 以避免死锁
+            summary_stats = {
+                "total": len(self.keys),
+                "active": sum(1 for k in self.keys.values() if k.status == KeyStatus.ACTIVE),
+                "cooling": sum(1 for k in self.keys.values() if k.status == KeyStatus.COOLING),
+                "failed": sum(1 for k in self.keys.values() if k.status == KeyStatus.FAILED),
+            }
+            
             return {
-                "summary": await self.get_stats(),
+                "summary": summary_stats,
                 "performance": {
                     "total_requests": total_requests,
                     "successful_requests": total_successful,
@@ -443,7 +451,7 @@ class OAIStyleGeminiAdapter:
                     # 流式响应
                     logger.debug("Creating streaming response")
                     try:
-                        stream = model.generate_content_async(
+                        stream = await model.generate_content_async(
                             messages, 
                             stream=True, 
                             **api_call_kwargs
