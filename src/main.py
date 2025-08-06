@@ -1,13 +1,13 @@
-# src/main.py
+# src/main.py - 完整版本
 import asyncio
 import time
 import os
-from typing import Dict, Optional, Any, Set, AsyncGenerator, Union
+from typing import Dict, Optional, Any, Set, AsyncGenerator, Union, List
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
 
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -243,6 +243,40 @@ class GeminiKeyManager:
                 ]
             }
 
+    async def add_key(self, key: str) -> bool:
+        """动态添加新的API密钥"""
+        async with self.lock:
+            if key in self.keys:
+                return False  # 密钥已存在
+            
+            self.keys[key] = APIKeyInfo(key=key)
+            logger.info(f"Added new API key: {key[:8]}...")
+            return True
+
+    async def remove_key(self, key: str) -> bool:
+        """动态移除API密钥"""
+        async with self.lock:
+            if key not in self.keys:
+                return False  # 密钥不存在
+            
+            del self.keys[key]
+            logger.info(f"Removed API key: {key[:8]}...")
+            return True
+
+    async def update_key_status(self, key: str, status: KeyStatus) -> bool:
+        """更新密钥状态"""
+        async with self.lock:
+            if key not in self.keys:
+                return False
+            
+            self.keys[key].status = status
+            if status == KeyStatus.ACTIVE:
+                self.keys[key].cooling_until = None
+                self.keys[key].failure_count = 0
+            
+            logger.info(f"Updated key {key[:8]}... status to {status.value}")
+            return True
+
 key_manager: Optional[GeminiKeyManager] = None
 
 # --- 增强的 OpenAI 风格的 Gemini 适配器 ---
@@ -280,9 +314,17 @@ class OAIStyleGeminiAdapter:
             if not (0.0 <= request.temperature <= 2.0):
                 return "Temperature must be between 0.0 and 2.0"
             
+            # 验证top_p参数
+            if request.top_p is not None and not (0.0 <= request.top_p <= 1.0):
+                return "top_p must be between 0.0 and 1.0"
+            
             # 验证max_tokens
             if request.max_tokens is not None and request.max_tokens <= 0:
                 return "max_tokens must be positive"
+            
+            # 验证n参数
+            if hasattr(request, 'n') and request.n is not None and (request.n < 1 or request.n > 10):
+                return "n must be between 1 and 10"
             
             return None
             
@@ -300,7 +342,9 @@ class OAIStyleGeminiAdapter:
         last_error = None
         max_attempts = min(config.GEMINI_MAX_RETRIES + 1, len(self.key_manager.keys))
         
-        logger.info(f"Processing chat completion request for model: {request.model}, stream: {request.stream}, tools: {len(request.tools) if request.tools else 0}")
+        candidate_count = getattr(request, 'n', 1) or 1
+        
+        logger.info(f"Processing chat completion request for model: {request.model}, stream: {request.stream}, tools: {len(request.tools) if request.tools else 0}, n: {candidate_count}")
         
         for attempt in range(max_attempts):
             key_info = await self.key_manager.get_available_key()
@@ -323,12 +367,13 @@ class OAIStyleGeminiAdapter:
                 if not messages:
                     raise HTTPException(status_code=400, detail="No valid messages after conversion")
                 
-                # 转换工具定义
+                # 转换工具定义和工具选择
                 tools = None
+                tool_config = None
                 if request.tools:
                     try:
-                        tools = self.api_config.openai_to_gemini.convert_tools(request.tools, request.tool_choice)
-                        logger.debug(f"Converted {len(request.tools)} tools to Gemini format")
+                        tools, tool_config = self.api_config.openai_to_gemini.convert_tools(request.tools, request.tool_choice)
+                        logger.debug(f"Converted {len(request.tools)} tools to Gemini format with tool_config: {tool_config}")
                     except Exception as tool_error:
                         logger.error(f"Error converting tools: {tool_error}")
                         raise HTTPException(status_code=400, detail=f"Tool conversion error: {str(tool_error)}")
@@ -344,30 +389,54 @@ class OAIStyleGeminiAdapter:
                 
                 if tools:
                     model_kwargs["tools"] = tools
-                
+
                 model = genai.GenerativeModel(**model_kwargs)
                 
-                # 生成配置
-                generation_config = genai.types.GenerationConfig(
-                    max_output_tokens=min(request.max_tokens or 4096, 8192),  # 限制最大tokens
-                    temperature=request.temperature,
-                    candidate_count=1  # 确保只生成一个候选
-                )
+                # 增强的生成配置，包含top_p和response_format支持
+                generation_config_kwargs = {
+                    "max_output_tokens": min(request.max_tokens or 8192, 8192),
+                    "temperature": request.temperature,
+                    "candidate_count": candidate_count,  # 支持多候选回复
+                }
                 
-                # 请求配置
+                # 添加top_p支持
+                if request.top_p is not None:
+                    generation_config_kwargs["top_p"] = request.top_p
+                
+                # 添加JSON输出格式支持
+                if request.response_format and request.response_format.get("type") == "json_object":
+                    generation_config_kwargs["response_mime_type"] = "application/json"
+                    logger.debug("Enabled JSON response format")
+                
+                generation_config = genai.types.GenerationConfig(**generation_config_kwargs)
+                
+                # 请求配置，包含tool_config
                 request_options = {
                     'timeout': config.GEMINI_REQUEST_TIMEOUT
                 }
                 
+                # API调用参数
+                api_call_kwargs = {
+                    "generation_config": generation_config,
+                    "request_options": request_options
+                }
+                
+                # 添加tool_config支持
+                if tool_config:
+                    api_call_kwargs["tool_config"] = tool_config
+                    logger.debug(f"Using tool_config: {tool_config}")
+                
                 if request.stream:
+                    if candidate_count > 1:
+                        raise HTTPException(status_code=400, detail="Streaming is not supported when n > 1.")
+                        
                     # 流式响应
                     logger.debug("Creating streaming response")
                     try:
                         stream = model.generate_content_async(
                             messages, 
                             stream=True, 
-                            generation_config=generation_config,
-                            request_options=request_options
+                            **api_call_kwargs
                         )
                         
                         # 包装流式响应以处理成功/失败
@@ -392,8 +461,7 @@ class OAIStyleGeminiAdapter:
                     logger.debug("Creating non-streaming response")
                     response = await model.generate_content_async(
                         messages, 
-                        generation_config=generation_config,
-                        request_options=request_options
+                        **api_call_kwargs
                     )
                     
                     # 检查响应有效性
@@ -538,6 +606,8 @@ app = FastAPI(
     - 🌐 Full OpenAI API compatibility
     - ⚡ Optimized error handling and recovery
     - 🎯 Smart quota management and exponential backoff
+    - 🔧 Dynamic key management for runtime flexibility
+    - 🎛️ Advanced generation parameters (top_p, JSON format, multiple candidates)
     
     ## Authentication
     Use either:
@@ -549,7 +619,7 @@ app = FastAPI(
     - Smart key rotation on failures
     - Detailed error reporting and logging
     """,
-    version="4.1.0",
+    version="4.2.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -558,7 +628,7 @@ app = FastAPI(
 # 添加CORS中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 在生产环境中应该更严格
+    allow_origins=config.SERVICE_CORS_ORIGINS, # 使用配置文件中的设置
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -604,10 +674,11 @@ async def create_chat_completion(
 
 @app.get("/v1/models", 
          summary="List models", 
-         description="List available models in OpenAI format with enhanced metadata")
+         description="List available models in OpenAI format with accurate metadata")
 async def list_models(client_key: str = Depends(verify_api_key)):
-    """OpenAI兼容的模型列表端点"""
+    """OpenAI兼容的模型列表端点，提供准确的模型信息"""
     current_time = int(time.time())
+    # 修复：提供准确的max_tokens并完成列表
     model_data = [
         {
             "id": "gpt-4o",
@@ -617,8 +688,9 @@ async def list_models(client_key: str = Depends(verify_api_key)):
             "permission": [],
             "root": "gpt-4o",
             "parent": None,
-            "max_tokens": 8192,
-            "capabilities": ["chat", "tools", "streaming"]
+            "context_window": 1048576,
+            "max_tokens": 8192, # Gemini 1.5 Pro max output is 8192
+            "capabilities": ["chat", "tools", "streaming", "json_mode", "vision"]
         },
         {
             "id": "gpt-4-turbo",
@@ -628,8 +700,9 @@ async def list_models(client_key: str = Depends(verify_api_key)):
             "permission": [],
             "root": "gpt-4-turbo",
             "parent": None,
+            "context_window": 1048576,
             "max_tokens": 8192,
-            "capabilities": ["chat", "tools", "streaming"]
+            "capabilities": ["chat", "tools", "streaming", "json_mode", "vision"]
         },
         {
             "id": "gpt-4o-mini",
@@ -639,8 +712,9 @@ async def list_models(client_key: str = Depends(verify_api_key)):
             "permission": [],
             "root": "gpt-4o-mini",
             "parent": None,
-            "max_tokens": 8192,
-            "capabilities": ["chat", "tools", "streaming"]
+            "context_window": 1048576,
+            "max_tokens": 8192, # Gemini 1.5 Flash max output is 8192
+            "capabilities": ["chat", "tools", "streaming", "json_mode", "vision"]
         },
         {
             "id": "gpt-3.5-turbo",
@@ -650,8 +724,9 @@ async def list_models(client_key: str = Depends(verify_api_key)):
             "permission": [],
             "root": "gpt-3.5-turbo",
             "parent": None,
-            "max_tokens": 4096,
-            "capabilities": ["chat", "tools", "streaming"]
+            "context_window": 1048576,
+            "max_tokens": 8192,
+            "capabilities": ["chat", "tools", "streaming", "json_mode", "vision"]
         },
     ]
     return {"object": "list", "data": model_data}
@@ -676,7 +751,7 @@ async def health_check():
         "status": "healthy" if is_healthy else "degraded",
         "timestamp": int(time.time()),
         "service": "OpenAI-Style Gemini Adapter",
-        "version": "4.1.0",
+        "version": "4.2.0",
         "key_summary": stats,
         "performance": detailed_stats["performance"],
         "uptime": time.time() - getattr(app.state, 'start_time', time.time()),
@@ -704,3 +779,74 @@ async def get_stats(client_key: str = Depends(verify_api_key)):
     }
 
     return JSONResponse(content=all_stats)
+
+
+# --- 新增：动态密钥管理端点 ---
+
+@app.post("/admin/keys", 
+          summary="Add a new Gemini API key", 
+          tags=["Admin Key Management"],
+          status_code=201)
+async def add_gemini_key(
+    admin_key: str = Depends(verify_admin_key),
+    key_to_add: str = Body(..., embed=True, description="The Gemini API key to add.")
+):
+    """动态添加一个新的Gemini API密钥到池中。"""
+    if not key_manager:
+        raise HTTPException(status_code=503, detail="Key Manager not initialized")
+    
+    success = await key_manager.add_key(key_to_add)
+    if not success:
+        raise HTTPException(status_code=409, detail="API key already exists.")
+    
+    return {"status": "success", "message": f"API key starting with {key_to_add[:8]} added."}
+
+
+@app.delete("/admin/keys", 
+            summary="Remove a Gemini API key", 
+            tags=["Admin Key Management"],
+            status_code=200)
+async def remove_gemini_key(
+    admin_key: str = Depends(verify_admin_key),
+    key_to_remove: str = Body(..., embed=True, description="The Gemini API key to remove.")
+):
+    """从池中动态移除一个指定的Gemini API密钥。"""
+    if not key_manager:
+        raise HTTPException(status_code=503, detail="Key Manager not initialized")
+
+    success = await key_manager.remove_key(key_to_remove)
+    if not success:
+        raise HTTPException(status_code=404, detail="API key not found.")
+    
+    return {"status": "success", "message": f"API key starting with {key_to_remove[:8]} removed."}
+
+
+@app.put("/admin/keys/{key_id}", 
+         summary="Update status of a Gemini API key", 
+         tags=["Admin Key Management"],
+         status_code=200)
+async def update_gemini_key_status(
+    key_id: str,
+    status: KeyStatus,
+    admin_key: str = Depends(verify_admin_key),
+):
+    """手动更新一个密钥的状态（例如，将一个冷却中的密钥重置为激活状态）。"""
+    if not key_manager:
+        raise HTTPException(status_code=503, detail="Key Manager not initialized")
+    
+    # 因为我们只存储了部分key信息，需要找到完整的key
+    full_key = None
+    for k in key_manager.keys.keys():
+        if k.startswith(key_id):
+            full_key = k
+            break
+            
+    if not full_key:
+         raise HTTPException(status_code=404, detail=f"No key found starting with '{key_id}'")
+
+    success = await key_manager.update_key_status(full_key, status)
+    if not success:
+        # This case is unlikely if the above check passes, but for completeness
+        raise HTTPException(status_code=404, detail="API key not found for status update.")
+
+    return {"status": "success", "message": f"Status of key {full_key[:8]}... updated to {status.value}."}
