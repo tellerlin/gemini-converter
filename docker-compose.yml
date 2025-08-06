@@ -1,7 +1,7 @@
 services:
-  gemini-claude-adapter:
+  gemini-converter-adapter:
     build: .
-    container_name: gemini-claude-adapter
+    container_name: gemini-converter-adapter
     restart: always
     ports:
       # 将主机的 8100 端口映射到容器的 8100 端口

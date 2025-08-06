@@ -27,8 +27,8 @@
 ### 步骤 1: 克隆仓库
 
 ```bash
-git clone [https://github.com/tellerlin/gemini-claude.git](https://github.com/tellerlin/gemini-claude.git)
-cd gemini-claude
+git clone https://github.com/tellerlin/gemini-converter.git
+cd gemini-conterter
 ````
 
 ### 步骤 2: 配置 API 密钥
@@ -164,7 +164,7 @@ if __name__ == "__main__":
 `api_key_checker.py` 脚本会测试你 `.env` 文件中的每一个 `GEMINI_API_KEYS`，验证其有效性、配额和模型访问权限。
 
 ```bash
-docker-compose run --rm gemini-claude-adapter python api_key_checker.py
+docker-compose run --rm gemini-conterter-adapter python api_key_checker.py
 ```
 
 ### 2\. 通用健康与依赖检查
@@ -172,7 +172,7 @@ docker-compose run --rm gemini-claude-adapter python api_key_checker.py
 `diagnose_script.py` 会执行通用健康检查，验证项目文件和 Python 依赖是否完整 。
 
 ```bash
-docker-compose run --rm gemini-claude-adapter python diagnose_script.py
+docker-compose run --rm gemini-conterter-adapter python diagnose_script.py
 ```
 
 ## 📡 API 端点
