@@ -14,7 +14,6 @@ services:
     volumes:
       # Mount the logs directory
       - ./logs:/app/logs
-      # Mount the entire project directory to /data with write permissions
+      # Mount the entire project directory to /data for easy access if needed
       - .:/data
-    # Run as root for script execution (allows writing files)
-    user: "0:0"
+    # [修正] 移除 user: "0:0" 行，以使用 Dockerfile 中定义的 appuser

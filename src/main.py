@@ -38,6 +38,9 @@ class APIKeyInfo:
     status: KeyStatus = KeyStatus.ACTIVE
     failure_count: int = 0
     cooling_until: Optional[float] = None
+    last_used: Optional[float] = None
+    total_requests: int = 0
+    successful_requests: int = 0
 
 # --- 依赖注入与安全 ---
 config = get_config()
@@ -80,7 +83,7 @@ async def verify_admin_key(
     
     raise HTTPException(status_code=403, detail="Invalid Admin API Key")
 
-# --- Gemini 密钥管理器 ---
+# --- 增强的 Gemini 密钥管理器 ---
 class GeminiKeyManager:
     def __init__(self):
         self.keys: Dict[str, APIKeyInfo] = {
@@ -95,7 +98,7 @@ class GeminiKeyManager:
         logger.info(f"Initialized {len(self.keys)} Gemini API keys.")
 
     async def get_available_key(self) -> Optional[APIKeyInfo]:
-        """获取可用的API密钥，使用轮询策略"""
+        """获取可用的API密钥，使用智能轮询策略"""
         async with self.lock:
             self._recover_keys()
             active_keys = [k for k in self.keys.values() if k.status == KeyStatus.ACTIVE]
@@ -104,10 +107,24 @@ class GeminiKeyManager:
                 logger.warning("No active Gemini API keys available")
                 return None
             
-            # 轮询策略
-            self.last_used_key_index = (self.last_used_key_index + 1) % len(active_keys)
-            selected_key = active_keys[self.last_used_key_index]
-            logger.debug(f"Selected key: {selected_key.key[:8]}...")
+            # 智能轮询策略：优先选择最近未使用的密钥
+            now = time.time()
+            active_keys.sort(key=lambda k: k.last_used or 0)
+            
+            # 如果有从未使用的密钥，优先使用
+            unused_keys = [k for k in active_keys if k.last_used is None]
+            if unused_keys:
+                selected_key = unused_keys[0]
+            else:
+                # 使用轮询策略
+                self.last_used_key_index = (self.last_used_key_index + 1) % len(active_keys)
+                selected_key = active_keys[self.last_used_key_index]
+            
+            # 更新使用记录
+            selected_key.last_used = now
+            selected_key.total_requests += 1
+            
+            logger.debug(f"Selected key: {selected_key.key[:8]}... (total requests: {selected_key.total_requests})")
             return selected_key
 
     def _recover_keys(self):
@@ -121,13 +138,22 @@ class GeminiKeyManager:
                 now > key_info.cooling_until):
                 
                 key_info.status = KeyStatus.ACTIVE
-                key_info.failure_count = 0
                 key_info.cooling_until = None
                 recovered_count += 1
                 logger.info(f"Key {key_info.key[:8]}... recovered to ACTIVE.")
         
         if recovered_count > 0:
             logger.info(f"Recovered {recovered_count} keys from cooling state")
+
+    async def mark_key_success(self, key: str):
+        """标记密钥使用成功"""
+        async with self.lock:
+            if key in self.keys:
+                key_info = self.keys[key]
+                key_info.successful_requests += 1
+                # 成功请求后重置失败计数（部分重置）
+                if key_info.failure_count > 0:
+                    key_info.failure_count = max(0, key_info.failure_count - 1)
 
     async def mark_key_failed(self, key: str, error: Exception):
         """标记密钥失败并进入冷却或永久失败状态"""
@@ -146,17 +172,31 @@ class GeminiKeyManager:
                 google_exceptions.InvalidArgument
             ))
             
-            if is_permanent or key_info.failure_count >= config.GEMINI_MAX_RETRIES:
+            # 判断是否为临时性错误（如配额限制）
+            is_quota_error = isinstance(error, google_exceptions.ResourceExhausted)
+            
+            if is_permanent:
                 key_info.status = KeyStatus.FAILED
                 status_msg = "permanently FAILED"
+            elif is_quota_error:
+                # 配额错误使用更长的冷却时间
+                key_info.status = KeyStatus.COOLING
+                key_info.cooling_until = time.time() + (config.GEMINI_COOLING_PERIOD * 3)
+                status_msg = f"COOLING (quota) for {config.GEMINI_COOLING_PERIOD * 3}s"
+            elif key_info.failure_count >= config.GEMINI_MAX_RETRIES:
+                key_info.status = KeyStatus.FAILED
+                status_msg = "permanently FAILED (max retries exceeded)"
             else:
                 key_info.status = KeyStatus.COOLING
-                key_info.cooling_until = time.time() + config.GEMINI_COOLING_PERIOD
-                status_msg = f"COOLING for {config.GEMINI_COOLING_PERIOD}s"
+                # 指数退避冷却时间
+                cooling_time = config.GEMINI_COOLING_PERIOD * (2 ** (key_info.failure_count - 1))
+                key_info.cooling_until = time.time() + min(cooling_time, 3600)  # 最多1小时
+                status_msg = f"COOLING for {min(cooling_time, 3600)}s"
             
             logger.warning(
                 f"Key {key_info.key[:8]}... marked as {status_msg}. "
                 f"Failure count: {key_info.failure_count}. "
+                f"Success rate: {key_info.successful_requests}/{key_info.total_requests}. "
                 f"Reason: {type(error).__name__}: {str(error)}"
             )
     
@@ -171,32 +211,108 @@ class GeminiKeyManager:
                 "failed": sum(1 for k in self.keys.values() if k.status == KeyStatus.FAILED),
             }
 
+    async def get_detailed_stats(self) -> Dict[str, Any]:
+        """获取详细的密钥统计信息"""
+        async with self.lock:
+            self._recover_keys()
+            
+            total_requests = sum(k.total_requests for k in self.keys.values())
+            total_successful = sum(k.successful_requests for k in self.keys.values())
+            
+            return {
+                "summary": await self.get_stats(),
+                "performance": {
+                    "total_requests": total_requests,
+                    "successful_requests": total_successful,
+                    "success_rate": total_successful / total_requests if total_requests > 0 else 0,
+                    "average_requests_per_key": total_requests / len(self.keys) if self.keys else 0
+                },
+                "keys": [
+                    {
+                        "key_id": key[:8] + "..." + key[-4:],
+                        "status": info.status.value,
+                        "failure_count": info.failure_count,
+                        "total_requests": info.total_requests,
+                        "successful_requests": info.successful_requests,
+                        "success_rate": info.successful_requests / info.total_requests if info.total_requests > 0 else 0,
+                        "cooling_until": info.cooling_until,
+                        "cooling_remaining": max(0, (info.cooling_until or 0) - time.time()) if info.cooling_until else 0,
+                        "last_used": info.last_used
+                    }
+                    for key, info in self.keys.items()
+                ]
+            }
+
 key_manager: Optional[GeminiKeyManager] = None
 
-# --- OpenAI 风格的 Gemini 适配器 ---
+# --- 增强的 OpenAI 风格的 Gemini 适配器 ---
 class OAIStyleGeminiAdapter:
     def __init__(self, key_mgr: GeminiKeyManager, api_cfg: APIConfig):
         self.key_manager = key_mgr
         self.api_config = api_cfg
 
+    def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
+        """验证请求参数，返回错误信息或None"""
+        try:
+            # 验证消息
+            if not request.messages:
+                return "Messages array cannot be empty"
+            
+            # 验证工具定义
+            if request.tools:
+                for i, tool in enumerate(request.tools):
+                    if not isinstance(tool, dict):
+                        return f"Tool {i} must be a dictionary"
+                    
+                    if tool.get("type") != "function":
+                        return f"Tool {i} type must be 'function'"
+                    
+                    function = tool.get("function", {})
+                    if not function.get("name"):
+                        return f"Tool {i} function must have a name"
+                    
+                    # 验证参数schema
+                    parameters = function.get("parameters", {})
+                    if not isinstance(parameters, dict):
+                        return f"Tool {i} parameters must be a dictionary"
+            
+            # 验证温度参数
+            if not (0.0 <= request.temperature <= 2.0):
+                return "Temperature must be between 0.0 and 2.0"
+            
+            # 验证max_tokens
+            if request.max_tokens is not None and request.max_tokens <= 0:
+                return "max_tokens must be positive"
+            
+            return None
+            
+        except Exception as e:
+            return f"Request validation error: {str(e)}"
+
     async def process_chat_completion(self, request: ChatCompletionRequest) -> Union[Dict, AsyncGenerator[str, None]]:
-        """处理聊天完成请求，支持重试机制"""
+        """处理聊天完成请求，支持增强的重试机制和工具调用"""
+        
+        # 验证请求
+        validation_error = self._validate_request(request)
+        if validation_error:
+            raise HTTPException(status_code=400, detail=validation_error)
+        
         last_error = None
         max_attempts = min(config.GEMINI_MAX_RETRIES + 1, len(self.key_manager.keys))
         
-        logger.info(f"Processing chat completion request for model: {request.model}, stream: {request.stream}")
+        logger.info(f"Processing chat completion request for model: {request.model}, stream: {request.stream}, tools: {len(request.tools) if request.tools else 0}")
         
         for attempt in range(max_attempts):
             key_info = await self.key_manager.get_available_key()
             if not key_info:
                 logger.error("No available Gemini API keys. All keys are cooling or have failed.")
                 if attempt < max_attempts - 1:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(min(5 * (attempt + 1), 30))  # 指数退避等待
                     continue
                 else:
                     break
 
-            logger.info(f"Attempt {attempt + 1}/{max_attempts} using key {key_info.key[:8]}...")
+            logger.info(f"Attempt {attempt + 1}/{max_attempts} using key {key_info.key[:8]}... (req: {key_info.total_requests})")
             
             try:
                 # 配置Gemini API
@@ -204,22 +320,38 @@ class OAIStyleGeminiAdapter:
                 
                 # 转换请求格式
                 messages, system_prompt = self.api_config.openai_to_gemini.convert_messages(request.messages)
-                tools = self.api_config.openai_to_gemini.convert_tools(request.tools)
+                if not messages:
+                    raise HTTPException(status_code=400, detail="No valid messages after conversion")
+                
+                # 转换工具定义
+                tools = None
+                if request.tools:
+                    try:
+                        tools = self.api_config.openai_to_gemini.convert_tools(request.tools, request.tool_choice)
+                        logger.debug(f"Converted {len(request.tools)} tools to Gemini format")
+                    except Exception as tool_error:
+                        logger.error(f"Error converting tools: {tool_error}")
+                        raise HTTPException(status_code=400, detail=f"Tool conversion error: {str(tool_error)}")
+                
                 model_name = self.api_config.openai_to_gemini.convert_model(request.model)
-
                 logger.debug(f"Converted to Gemini: model={model_name}, messages={len(messages)}, tools={len(tools) if tools else 0}")
 
                 # 创建生成模型
-                model = genai.GenerativeModel(
-                    model_name=model_name,
-                    system_instruction=system_prompt,
-                    tools=tools
-                )
+                model_kwargs = {
+                    "model_name": model_name,
+                    "system_instruction": system_prompt,
+                }
+                
+                if tools:
+                    model_kwargs["tools"] = tools
+                
+                model = genai.GenerativeModel(**model_kwargs)
                 
                 # 生成配置
                 generation_config = genai.types.GenerationConfig(
-                    max_output_tokens=request.max_tokens,
-                    temperature=request.temperature
+                    max_output_tokens=min(request.max_tokens or 4096, 8192),  # 限制最大tokens
+                    temperature=request.temperature,
+                    candidate_count=1  # 确保只生成一个候选
                 )
                 
                 # 请求配置
@@ -230,13 +362,31 @@ class OAIStyleGeminiAdapter:
                 if request.stream:
                     # 流式响应
                     logger.debug("Creating streaming response")
-                    stream = model.generate_content_async(
-                        messages, 
-                        stream=True, 
-                        generation_config=generation_config,
-                        request_options=request_options
-                    )
-                    return self.api_config.gemini_to_openai.convert_stream_response(stream, request)
+                    try:
+                        stream = model.generate_content_async(
+                            messages, 
+                            stream=True, 
+                            generation_config=generation_config,
+                            request_options=request_options
+                        )
+                        
+                        # 包装流式响应以处理成功/失败
+                        async def wrapped_stream():
+                            try:
+                                async for chunk in self.api_config.gemini_to_openai.convert_stream_response(stream, request):
+                                    yield chunk
+                                # 如果流完成没有异常，标记成功
+                                await self.key_manager.mark_key_success(key_info.key)
+                            except Exception as stream_error:
+                                await self.key_manager.mark_key_failed(key_info.key, stream_error)
+                                raise
+                        
+                        return wrapped_stream()
+                        
+                    except Exception as stream_setup_error:
+                        logger.error(f"Error setting up stream: {stream_setup_error}")
+                        await self.key_manager.mark_key_failed(key_info.key, stream_setup_error)
+                        raise
                 else:
                     # 非流式响应
                     logger.debug("Creating non-streaming response")
@@ -245,8 +395,48 @@ class OAIStyleGeminiAdapter:
                         generation_config=generation_config,
                         request_options=request_options
                     )
-                    return self.api_config.gemini_to_openai.convert_response(response, request)
+                    
+                    # 检查响应有效性
+                    if not response.candidates:
+                        raise ValueError("No candidates in Gemini response")
+                    
+                    # 标记成功并转换响应
+                    await self.key_manager.mark_key_success(key_info.key)
+                    converted_response = self.api_config.gemini_to_openai.convert_response(response, request)
+                    
+                    return converted_response
             
+            except google_exceptions.ResourceExhausted as quota_error:
+                last_error = quota_error
+                logger.warning(f"Quota exhausted for key {key_info.key[:8]}...: {quota_error}")
+                await self.key_manager.mark_key_failed(key_info.key, quota_error)
+                continue
+                
+            except google_exceptions.InvalidArgument as arg_error:
+                last_error = arg_error
+                logger.error(f"Invalid argument for key {key_info.key[:8]}...: {arg_error}")
+                await self.key_manager.mark_key_failed(key_info.key, arg_error)
+                # 参数错误通常是请求本身的问题，不需要重试其他密钥
+                raise HTTPException(status_code=400, detail=f"Invalid request: {str(arg_error)}")
+                
+            except google_exceptions.PermissionDenied as perm_error:
+                last_error = perm_error
+                logger.error(f"Permission denied for key {key_info.key[:8]}...: {perm_error}")
+                await self.key_manager.mark_key_failed(key_info.key, perm_error)
+                continue
+                
+            except google_exceptions.Unauthenticated as auth_error:
+                last_error = auth_error
+                logger.error(f"Authentication failed for key {key_info.key[:8]}...: {auth_error}")
+                await self.key_manager.mark_key_failed(key_info.key, auth_error)
+                continue
+                
+            except asyncio.TimeoutError as timeout_error:
+                last_error = timeout_error
+                logger.warning(f"Timeout for key {key_info.key[:8]}...: {timeout_error}")
+                await self.key_manager.mark_key_failed(key_info.key, timeout_error)
+                continue
+                
             except Exception as e:
                 last_error = e
                 error_msg = f"Attempt {attempt+1} failed with key {key_info.key[:8]}. Error: {type(e).__name__}: {str(e)}"
@@ -261,9 +451,21 @@ class OAIStyleGeminiAdapter:
                     await asyncio.sleep(wait_time)
         
         # 所有尝试都失败了
-        detail = f"All {max_attempts} attempts failed. Last error: {type(last_error).__name__}: {str(last_error)}"
+        if isinstance(last_error, google_exceptions.ResourceExhausted):
+            detail = "All API keys have reached their quota limits. Please try again later."
+            status_code = 429  # Too Many Requests
+        elif isinstance(last_error, google_exceptions.PermissionDenied):
+            detail = "All API keys lack necessary permissions."
+            status_code = 403  # Forbidden
+        elif isinstance(last_error, google_exceptions.Unauthenticated):
+            detail = "All API keys are invalid or expired."
+            status_code = 401  # Unauthorized
+        else:
+            detail = f"All {max_attempts} attempts failed. Last error: {type(last_error).__name__}: {str(last_error)}"
+            status_code = 502  # Bad Gateway
+            
         logger.error(detail)
-        raise HTTPException(status_code=502, detail=detail)
+        raise HTTPException(status_code=status_code, detail=detail)
 
 adapter: Optional[OAIStyleGeminiAdapter] = None
 
@@ -275,6 +477,7 @@ async def lifespan(app: FastAPI):
     
     # 启动时的初始化
     logger.info("🚀 Starting OpenAI-Style Gemini Adapter...")
+    app.state.start_time = time.time()
     
     # 创建日志目录
     os.makedirs("logs", exist_ok=True)
@@ -324,22 +527,29 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="OpenAI-Style Gemini Adapter",
     description="""
-    Bridges OpenAI API requests to Google's Gemini Pro with smart key rotation.
+    Advanced bridge between OpenAI API and Google's Gemini Pro with enhanced features.
     
     ## Features
-    - 🔄 Smart API key rotation and recovery
+    - 🔄 Intelligent API key rotation with success tracking
     - 🚀 Streaming and non-streaming responses
-    - 🛠️ Function/tool calling support
-    - 📊 Performance monitoring
-    - 🔒 Secure API key management
-    - 🌐 OpenAI-compatible endpoints
+    - 🛠️ Enhanced function/tool calling support with validation
+    - 📊 Comprehensive performance monitoring
+    - 🔒 Secure API key management with detailed statistics
+    - 🌐 Full OpenAI API compatibility
+    - ⚡ Optimized error handling and recovery
+    - 🎯 Smart quota management and exponential backoff
     
     ## Authentication
     Use either:
     - `X-API-Key` header
     - `Authorization: Bearer <token>` header
+    
+    ## Error Handling
+    - Automatic retry with exponential backoff
+    - Smart key rotation on failures
+    - Detailed error reporting and logging
     """,
-    version="4.0.0",
+    version="4.1.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -358,12 +568,12 @@ app.add_middleware(
 
 @app.post("/v1/chat/completions", 
           summary="Create chat completion", 
-          description="Create a chat completion, compatible with OpenAI API")
+          description="Create a chat completion with enhanced tool support, compatible with OpenAI API")
 async def create_chat_completion(
     request: ChatCompletionRequest, 
     client_key: str = Depends(verify_api_key)
 ):
-    """OpenAI兼容的聊天完成端点"""
+    """OpenAI兼容的聊天完成端点，支持增强的工具调用"""
     if not adapter:
         raise HTTPException(status_code=503, detail="Service not initialized")
     
@@ -374,12 +584,13 @@ async def create_chat_completion(
             if request.stream:
                 return StreamingResponse(
                     response, 
-                    media_type="text/plain",
+                    media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
                         "Connection": "keep-alive",
                         "Content-Type": "text/event-stream",
                         "Access-Control-Allow-Origin": "*",
+                        "X-Accel-Buffering": "no",  # 禁用nginx缓冲
                     }
                 )
             else:
@@ -393,36 +604,54 @@ async def create_chat_completion(
 
 @app.get("/v1/models", 
          summary="List models", 
-         description="List available models in OpenAI format")
+         description="List available models in OpenAI format with enhanced metadata")
 async def list_models(client_key: str = Depends(verify_api_key)):
     """OpenAI兼容的模型列表端点"""
+    current_time = int(time.time())
     model_data = [
         {
             "id": "gpt-4o",
             "object": "model",
-            "created": int(time.time()),
+            "created": current_time,
             "owned_by": "openai-emulated",
             "permission": [],
             "root": "gpt-4o",
             "parent": None,
+            "max_tokens": 8192,
+            "capabilities": ["chat", "tools", "streaming"]
         },
         {
             "id": "gpt-4-turbo",
             "object": "model",
-            "created": int(time.time()),
+            "created": current_time,
             "owned_by": "openai-emulated",
             "permission": [],
             "root": "gpt-4-turbo",
             "parent": None,
+            "max_tokens": 8192,
+            "capabilities": ["chat", "tools", "streaming"]
+        },
+        {
+            "id": "gpt-4o-mini",
+            "object": "model",
+            "created": current_time,
+            "owned_by": "openai-emulated",
+            "permission": [],
+            "root": "gpt-4o-mini",
+            "parent": None,
+            "max_tokens": 8192,
+            "capabilities": ["chat", "tools", "streaming"]
         },
         {
             "id": "gpt-3.5-turbo",
             "object": "model",
-            "created": int(time.time()),
+            "created": current_time,
             "owned_by": "openai-emulated",
             "permission": [],
             "root": "gpt-3.5-turbo",
             "parent": None,
+            "max_tokens": 4096,
+            "capabilities": ["chat", "tools", "streaming"]
         },
     ]
     return {"object": "list", "data": model_data}
@@ -431,13 +660,15 @@ async def list_models(client_key: str = Depends(verify_api_key)):
 
 @app.get("/health", 
          summary="Health check", 
-         description="Check service health and key availability")
+         description="Check service health and key availability with detailed status")
 async def health_check():
-    """健康检查端点"""
+    """增强的健康检查端点"""
     if not key_manager:
         raise HTTPException(status_code=503, detail="Key Manager not initialized")
     
     stats = await key_manager.get_stats()
+    detailed_stats = await key_manager.get_detailed_stats()
+    
     is_healthy = stats["active"] > 0
     status_code = 200 if is_healthy else 503
     
@@ -445,137 +676,31 @@ async def health_check():
         "status": "healthy" if is_healthy else "degraded",
         "timestamp": int(time.time()),
         "service": "OpenAI-Style Gemini Adapter",
-        "version": "4.0.0",
-        **stats
+        "version": "4.1.0",
+        "key_summary": stats,
+        "performance": detailed_stats["performance"],
+        "uptime": time.time() - getattr(app.state, 'start_time', time.time()),
+        "message": "All systems operational" if is_healthy else "Some API keys unavailable"
     }
     
     return JSONResponse(content=health_data, status_code=status_code)
 
 @app.get("/stats", 
          summary="Get statistics", 
-         description="Get service performance and key usage statistics")
+         description="Get comprehensive service performance and key usage statistics")
 async def get_stats(client_key: str = Depends(verify_api_key)):
-    """统计信息端点"""
+    """增强的统计信息端点"""
     if not key_manager:
         raise HTTPException(status_code=503, detail="Key Manager not initialized")
-    
-    key_stats = await key_manager.get_stats()
+
+    key_stats = await key_manager.get_detailed_stats()
     perf_stats = get_performance_stats()
-    
-    return {
-        "timestamp": int(time.time()),
-        "key_stats": key_stats,
-        "performance_stats": perf_stats,
-        "service_info": {
-            "name": "OpenAI-Style Gemini Adapter",
-            "version": "4.0.0",
-            "uptime": time.time() - app.state.start_time if hasattr(app.state, 'start_time') else 0
-        }
+
+    # Combinar todas las estadísticas en una sola respuesta
+    all_stats = {
+        "key_management_stats": key_stats,
+        "adapter_performance_stats": perf_stats.get("performance_stats", {}),
+        "cache_stats": perf_stats.get("cache_stats", {})
     }
 
-@app.get("/admin/keys", 
-         summary="Admin: Key status", 
-         description="Get detailed key status information (admin only)")
-async def admin_key_status(admin_key: str = Depends(verify_admin_key)):
-    """管理员密钥状态端点"""
-    if not key_manager:
-        raise HTTPException(status_code=503, detail="Key Manager not initialized")
-    
-    detailed_stats = []
-    async with key_manager.lock:
-        key_manager._recover_keys()
-        for key, info in key_manager.keys.items():
-            detailed_stats.append({
-                "key_id": key[:8] + "..." + key[-4:],
-                "status": info.status.value,
-                "failure_count": info.failure_count,
-                "cooling_until": info.cooling_until,
-                "cooling_remaining": max(0, (info.cooling_until or 0) - time.time()) if info.cooling_until else 0
-            })
-    
-    return {
-        "timestamp": int(time.time()),
-        "keys": detailed_stats,
-        "summary": await key_manager.get_stats()
-    }
-
-# --- 基础端点 ---
-
-@app.get("/", 
-         summary="Service info", 
-         description="Get basic service information")
-async def root():
-    """根端点，返回服务基本信息"""
-    return {
-        "service": "OpenAI-Style Gemini Adapter",
-        "version": "4.0.0",
-        "status": "running",
-        "timestamp": int(time.time()),
-        "documentation": {
-            "openapi": "/docs",
-            "redoc": "/redoc"
-        },
-        "endpoints": {
-            "chat_completions": "/v1/chat/completions",
-            "models": "/v1/models",
-            "health": "/health",
-            "stats": "/stats"
-        }
-    }
-
-@app.get("/favicon.ico")
-async def favicon():
-    """防止favicon请求产生404错误"""
-    return JSONResponse(content={"detail": "No favicon available"}, status_code=404)
-
-# --- 启动时记录开始时间 ---
-@app.on_event("startup")
-async def startup_event():
-    """记录应用启动时间"""
-    app.state.start_time = time.time()
-
-# --- 异常处理 ---
-@app.exception_handler(404)
-async def not_found_handler(request: Request, exc: HTTPException):
-    """404错误处理"""
-    return JSONResponse(
-        status_code=404,
-        content={
-            "error": {
-                "type": "not_found",
-                "message": f"The requested endpoint {request.url.path} was not found",
-                "available_endpoints": [
-                    "/v1/chat/completions",
-                    "/v1/models", 
-                    "/health",
-                    "/stats",
-                    "/docs"
-                ]
-            }
-        }
-    )
-
-@app.exception_handler(500)
-async def internal_error_handler(request: Request, exc: Exception):
-    """500错误处理"""
-    logger.error(f"Internal server error on {request.url.path}: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": {
-                "type": "internal_server_error",
-                "message": "An internal server error occurred",
-                "request_id": str(time.time())
-            }
-        }
-    )
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
-    )
+    return JSONResponse(content=all_stats)
