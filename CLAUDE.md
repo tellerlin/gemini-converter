@@ -65,9 +65,31 @@ This is a FastAPI-based adapter that provides OpenAI-compatible endpoints for Go
 
 - Always test with multiple API keys to verify rotation
 - Monitor key statistics in production environments
-- Use Context7 MCP for latest FastAPI best practices
+- **Actively use Context7 MCP** for accessing up-to-date FastAPI documentation and code examples during development
 - Follow async/await patterns consistently
 - Maintain backward compatibility for API endpoints
+
+## Context7 MCP Integration
+
+Context7 MCP provides real-time access to the latest library documentation and code examples. **Use it actively** when:
+
+### FastAPI Development
+- **Query for latest patterns**: `use context7 to show me FastAPI async middleware patterns`
+- **Get current best practices**: `use context7 for FastAPI dependency injection examples`
+- **Find updated syntax**: `use context7 to show Pydantic v2 model definitions`
+
+### Library Updates
+- **Check compatibility**: `use context7 to verify uvicorn latest configuration options`
+- **Explore new features**: `use context7 for new FastAPI response model features`
+- **Validate approaches**: `use context7 to confirm async context manager patterns`
+
+### Installation and Setup
+Context7 MCP is installed via Node.js:
+```bash
+npx -y @upstash/context7-mcp@latest
+```
+
+**Always leverage Context7 MCP** when working with any external libraries to ensure you're using the most current APIs and following the latest recommended patterns.
 
 ## Environment Variables
 

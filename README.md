@@ -255,6 +255,112 @@ curl -X POST "http://localhost:8000/gemini/v1beta/models/gemini-1.5-flash-latest
 | **JetBrains IDE** | AI Assistant → OpenAI → Custom server URL |
 | **Open-WebUI** | Settings → Connections → OpenAI API |
 | **ChatGPT Next Web** | Settings → API Host |
+| **Gemini CLI** | 设置 `GEMINI_BASE_URL` 环境变量 |
+| **Cherry Studio** | Model Provider 设置中的 API 地址 |
+
+### Gemini CLI 配置
+
+**Gemini CLI** 支持通过环境变量配置自定义 API 端点，将请求重定向到本项目的代理服务。
+
+**配置步骤：**
+
+1. **设置环境变量** - 配置以下环境变量：
+   ```bash
+   # 设置自定义 API 端点（指向本项目服务）
+   export GEMINI_BASE_URL="http://localhost:8000/gemini/v1beta"
+   
+   # 设置认证密钥（使用本项目的客户端密钥）
+   export GEMINI_API_KEY="your-client-key"  # 你的 SECURITY_ADAPTER_API_KEYS 值
+   ```
+
+2. **持久化配置** - 将环境变量添加到 shell 配置文件：
+   ```bash
+   # 对于 bash 用户
+   echo 'export GEMINI_BASE_URL="http://localhost:8000/gemini/v1beta"' >> ~/.bashrc
+   echo 'export GEMINI_API_KEY="your-client-key"' >> ~/.bashrc
+   source ~/.bashrc
+   
+   # 对于 zsh 用户  
+   echo 'export GEMINI_BASE_URL="http://localhost:8000/gemini/v1beta"' >> ~/.zshrc
+   echo 'export GEMINI_API_KEY="your-client-key"' >> ~/.zshrc
+   source ~/.zshrc
+   ```
+
+3. **配置文件方式** - 或者使用 Gemini CLI 的配置文件：
+   ```bash
+   # 创建配置目录
+   mkdir -p ~/.gemini
+   
+   # 创建配置文件
+   cat > ~/.gemini/settings.json << EOF
+   {
+     "base_url": "http://localhost:8000/gemini/v1beta",
+     "api_key": "your-client-key"
+   }
+   EOF
+   ```
+
+4. **验证配置** - 测试配置是否生效：
+   ```bash
+   # 测试连接（假设 Gemini CLI 已安装）
+   gemini models list  # 应该通过代理服务获取模型列表
+   ```
+
+**配置优势：**
+- ✅ **智能密钥轮询** - 自动使用多个 Gemini API 密钥，避免单密钥限额
+- ✅ **故障自动转移** - 密钥失败时自动切换到可用密钥  
+- ✅ **本地化控制** - 通过本地代理服务统一管理所有 Gemini API 请求
+- ✅ **增强稳定性** - 内置重试机制和冷却保护
+
+### Cherry Studio 配置
+
+**Cherry Studio** 是支持多种 LLM 提供商的桌面客户端，可以配置自定义 API 端点来使用本项目的代理服务。
+
+**配置步骤：**
+
+1. **打开设置界面**：
+   - 启动 Cherry Studio 应用
+   - 点击左下角的 "Settings"（设置）按钮
+   - 选择 "Model Provider"（模型提供商）选项
+
+2. **添加自定义提供商**：
+   - 点击右上角的 "+" 按钮添加新的提供商
+   - 选择 "OpenAI Compatible" 或 "Custom Endpoint" 类型
+
+3. **配置 API 参数**：
+   ```
+   Provider Name: Gemini Converter (自定义名称)
+   API Base URL: http://localhost:8000/v1
+   API Key: your-client-key  # 你的 SECURITY_ADAPTER_API_KEYS 值
+   Model Names: gpt-3.5-turbo,gpt-4,gpt-4o  # 支持的模型列表
+   ```
+
+4. **高级配置（可选）**：
+   - **Stream Support**: 启用流式响应
+   - **Function Calling**: 启用工具调用功能
+   - **JSON Mode**: 启用 JSON 格式响应
+   - **Custom Headers**: 如需要可添加自定义请求头
+
+5. **保存并测试**：
+   - 点击 "Save" 保存配置
+   - 在对话界面选择新配置的提供商
+   - 发送测试消息验证连接
+
+**原生 Gemini 格式配置（高级）**：
+对于需要使用 Gemini 原生 API 格式的场景：
+```
+Provider Name: Gemini Native
+API Base URL: http://localhost:8000/gemini/v1beta
+API Key: your-client-key
+Authentication: X-API-Key Header
+Model Names: gemini-1.5-pro-latest,gemini-1.5-flash-latest
+```
+
+**配置优势：**
+- ✅ **多密钥轮询** - 享受本项目的智能密钥管理
+- ✅ **统一界面** - 在 Cherry Studio 中使用所有 Gemini 模型
+- ✅ **增强稳定性** - 通过代理服务提供的重试和故障转移机制
+- ✅ **本地控制** - 完全掌控 API 请求的路由和管理
 
 ### 编程接口
 
@@ -468,13 +574,9 @@ docker-compose run --rm gemini-converter-adapter python diagnose_script.py
 
 **查看统计信息**
 ```bash
-# 密钥使用情况（需要客户端密钥）
+# 系统统计信息（包含性能指标）
 curl -H "Authorization: Bearer your-client-key" \
      http://localhost:8000/stats
-
-# 系统指标
-curl -H "Authorization: Bearer your-client-key" \
-     http://localhost:8000/metrics
 ```
 
 ### 性能优化
@@ -503,7 +605,6 @@ CACHE_TTL=300
 | `GET /v1/models` | 获取可用模型列表（OpenAI格式） | 客户端密钥 |
 | `POST /v1/chat/completions` | 聊天对话接口（OpenAI格式） | 客户端密钥 |
 | `GET /stats` | 查看使用统计 | 客户端密钥 |
-| `GET /metrics` | 性能指标 | 客户端密钥 |
 
 ### 原生 Gemini API 接口
 
